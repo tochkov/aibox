@@ -43,9 +43,5 @@ AGENT is `claude` or `chatgpt`; without it, both.
 ## TODO
 
 - `aibox install [AGENT]`: install Claude Code and the ChatGPT app, so `setup` covers a
-  fresh machine.
-
-## See also
-
-[yolovm](https://github.com/tochkov/yolovm): Ubuntu desktop VMs for coding agents. aibox
-looks after the machine itself.
+  fresh machine. [yolovm](https://github.com/tochkov/yolovm)'s guest provisioning already
+  does this inside VMs; reuse it.
