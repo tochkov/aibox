@@ -1,0 +1,583 @@
+#!/bin/bash
+# aibox: keep this machine's coding agents, Claude Code and the ChatGPT app,
+# updated, signed in and reachable from other devices, with short SSH commands.
+#
+#   aibox                        status: sign-in, versions, updates, servers, busy sessions
+#   aibox update [AGENT]         update, then restart what runs an old version: idle ones at
+#                                once, busy ones as soon as their sessions finish
+#   aibox auth [AGENT]           sign in whatever is signed out, from this terminal
+#   aibox rc [AGENT] [DIR]       claude: serve DIR, by default this one, to claude.ai/code and the
+#                                Claude app; chatgpt: keep the app running with remote access on.
+#                                Without AGENT, it asks before serving a new directory
+#   aibox rc chatgpt --pair      also print a pairing code for a new controlling device
+#   aibox rc rm NAME|DIR         stop serving a directory
+#   aibox restart [AGENT] [--now]
+#                                restart once idle; --now doesn't wait for busy sessions
+#   aibox setup                  once: start servers at boot, let aibox update ChatGPT without a
+#                                password, move servers started by hand under aibox
+#
+# AGENT is claude or chatgpt; leaving it out covers both. `aibox claude update` works too.
+# Restarts run in systemd units of their own and wait for busy sessions, so an agent can
+# run aibox on itself: its server restarts once the agent's turn is over.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+SELF=$HERE/aibox
+UNIT_DIR=$HOME/.config/systemd/user
+RC_CONF=$HOME/.config/aibox/rc      # NAME.sh per server: cd DIR, exec claude remote-control FLAGS
+SESSIONS=$HOME/.claude/sessions     # PID.json per Claude session, with Claude's own busy/idle status
+CODEX=/usr/lib/chatgpt/resources/codex
+CODEX_THREADS=$HOME/.codex/sessions # a file per Codex thread; each turn logs task_started … task_complete
+CLAUDE_RELEASES=https://downloads.claude.ai/claude-code-releases
+SUDOERS=/etc/sudoers.d/aibox
+# The exact commands aibox setup allows without a password; sudoers matches them verbatim.
+APT_UPDATE=(/usr/bin/apt-get -qq update)
+APT_UPGRADE=(/usr/bin/apt-get -qq install --only-upgrade chatgpt claude-desktop) # skips what isn't installed
+PING="Reply with the single word pong."
+
+say() { printf '\n== %s\n' "$*"; }
+die() { echo "aibox: $*" >&2; exit 1; }
+ask() { # ask QUESTION: yes, unless someone at a terminal says no
+  local a
+  [ -t 0 ] || return 0
+  read -rp "$1 [Y/n] " a
+  [[ ! $a =~ ^[Nn] ]]
+}
+count() { echo $#; }
+short() { echo "${1/#$HOME/\~}"; }
+up_for() { # how long PID has run: 10d, 5h, 12m
+  local t; t=$(ps -o etime= -p "$1" | tr -d ' ' || true)
+  case $t in
+    *-*) echo "${t%%-*}d" ;;
+    *:*:*) echo "$((10#${t%%:*}))h" ;;
+    ?*) echo "$((10#${t%%:*}))m" ;;
+  esac
+}
+newer() { [ -n "$1" ] && [ -n "$2" ] && dpkg --compare-versions "$1" gt "$2"; }
+http_status() { # http_status URL HEADER...: 000 when unreachable; headers go in on stdin, keeping keys out of ps
+  local url=$1; shift
+  printf '%s\n' "$@" | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H @- "$url" || true
+}
+schedule() { # schedule KEY ARG...: run `aibox _when-idle ARG...` in a unit of its own, one per KEY
+  if systemctl --user is-active -q "aibox-wait-$1.service"; then return 0; fi
+  systemd-run --user --collect --quiet --unit="aibox-wait-$1" -- "$SELF" _when-idle "${@:2}"
+}
+waiting() { systemctl --user is-active -q "aibox-wait-$1.service"; }
+wait_idle() { # wait_idle CHECK...: until CHECK prints 0, polling every 20 s for up to a day
+  local i
+  for i in $(seq 4320); do
+    if [ "$("$@")" = 0 ]; then return 0; fi
+    sleep 20
+  done
+  echo "still busy after a day; gave up" >&2
+  return 1
+}
+
+# ------------------------------------------------------------------- claude
+claude_installed() { claude --version 2>/dev/null | awk '{print $1}' || true; }
+claude_newest() {
+  local channel; channel=$(jq -r '.autoUpdatesChannel // "latest"' "$HOME/.claude/settings.json" 2>/dev/null || echo latest)
+  curl -fsS --max-time 5 "$CLAUDE_RELEASES/$channel" 2>/dev/null || true
+}
+claude_auth() { # yes, no or offline: does Anthropic accept the saved key; if not, a ping through Claude
+  local key code
+  key=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null || true)
+  if [ -z "$key" ]; then echo no; return 0; fi
+  code=$(http_status https://api.anthropic.com/api/oauth/profile "Authorization: Bearer $key" 'anthropic-beta: oauth-2025-04-20')
+  case $code in 200) echo yes; return 0 ;; 000) echo offline; return 0 ;; esac
+  # A refused key may only be stale. Claude renews it the way its running sessions expect;
+  # renewing it here could leave them holding a dead one.
+  if claude_ping; then echo yes; else echo no; fi
+}
+claude_ping() { # inherited CLAUDE_CODE_* variables would make it act as a session of whatever runs aibox
+  (cd /tmp && env $(env | grep -o '^CLAUDE_CODE_[A-Z_]*' | sed 's/^/-u /') timeout 90 \
+    claude -p --model haiku --effort low --no-session-persistence --tools "" --strict-mcp-config "$PING") >/dev/null 2>&1
+}
+
+rc_pids() { # every `claude remote-control` server of this user
+  local pid argv
+  for pid in $(pgrep -u "$(id -u)" -f 'claude remote-control' || true); do
+    { mapfile -d '' -t argv < "/proc/$pid/cmdline"; } 2>/dev/null || continue
+    if [ "${argv[0]##*/}" = claude ] && [ "${argv[1]:-}" = remote-control ]; then echo "$pid"; fi
+  done
+}
+# A server starts its sessions from its own binary, so it runs the version it started with until it restarts.
+rc_version() { # the native installer names each binary after its version; otherwise ask the binary
+  local exe; exe=$(readlink "/proc/$1/exe" || true); exe=${exe% (deleted)}; exe=${exe##*/}
+  if [[ $exe =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$exe"
+  else "/proc/$1/exe" --version 2>/dev/null | awk '{print $1}' || true; fi
+}
+rc_name() { sed -n 's|.*/claude-rc@\(.*\)\.service$|\1|p' "/proc/$1/cgroup" 2>/dev/null || true; }
+rc_dir() { readlink "/proc/$1/cwd" || true; }
+session_pids() { pgrep -P "$1" -f -- '--sdk-url' || true; }
+rc_busy() { # sessions of server PID that aren't idle; a status that can't be read counts as busy
+  local s n=0
+  for s in $(session_pids "$1"); do
+    if [ "$(jq -r '.status // empty' "$SESSIONS/$s.json" 2>/dev/null || true)" != idle ]; then n=$((n + 1)); fi
+  done
+  echo $n
+}
+unit_busy() { # busy sessions of claude-rc@NAME; 0 when it isn't running
+  local pid; pid=$(systemctl --user show -p MainPID --value "claude-rc@$1.service" || echo 0)
+  if [ "$pid" = 0 ]; then echo 0; else rc_busy "$pid"; fi
+}
+rc_names() { local f; for f in "$RC_CONF"/*.sh; do if [ -e "$f" ]; then basename "$f" .sh; fi; done; }
+conf_dir() { bash -c 'eval "$(grep -m1 "^cd " "$1")" && pwd' _ "$RC_CONF/$1.sh" 2>/dev/null || true; }
+name_for() { # a server name for DIR: its folder name, numbered when taken
+  local base name i=2
+  base=${1##*/}; base=${base//[^A-Za-z0-9_-]/-}; base=${base:-root}; name=$base
+  while [ -e "$RC_CONF/$name.sh" ]; do name=$base-$i; i=$((i + 1)); done
+  echo "$name"
+}
+trusted() { # remote-control needs the directory itself trusted; a trusted parent doesn't count
+  [ "$(jq -r --arg d "$1" '.projects[$d].hasTrustDialogAccepted // false' "$HOME/.claude.json" 2>/dev/null)" = true ]
+}
+trust() { # serving a directory means trusting it, so record that as Claude's trust question would.
+  # Claude rereads ~/.claude.json before each save, so this edit survives its next one.
+  local tmp
+  if trusted "$1"; then return 0; fi
+  tmp=$(mktemp "$HOME/.claude.json.aibox.XXXXXX") # private, like the file it replaces
+  if jq --arg d "$1" '.projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' \
+       "$HOME/.claude.json" > "$tmp"; then mv "$tmp" "$HOME/.claude.json"
+  else rm -f "$tmp"; die "couldn't read ~/.claude.json; run claude once, then rerun"; fi
+  trusted "$1" || die "Claude saved over the trust record at the same moment; rerun"
+}
+start_server() { # start claude-rc@NAME and see that it stays up, so a failure shows now rather than later
+  systemctl --user enable --now --quiet "claude-rc@$1.service"
+  sleep 5
+  if [ "$(systemctl --user show -p SubState --value "claude-rc@$1.service")" = running ]; then
+    echo "$1 serves $(short "$2"); its sessions show in claude.ai/code and the Claude app"
+  else
+    echo "$1 keeps failing; to see why: cd $(short "$2") && claude remote-control" >&2
+  fi
+}
+rc_write() { # rc_write NAME DIR [FLAG...]: the script claude-rc@NAME runs
+  local name=$1 dir=$2 flags=()
+  shift 2
+  # Session names in the Claude app start with the server's name. Remote sessions get
+  # Claude in Chrome only when the server passes --chrome, whatever Claude's own default.
+  [[ " $* " == *' --remote-control-session-name-prefix '* ]] || flags+=(--remote-control-session-name-prefix "$name")
+  if [[ " $* " != *' --chrome '* && " $* " != *' --no-chrome '* ]] &&
+     [ "$(jq -r '.claudeInChromeDefaultEnabled // false' "$HOME/.claude.json" 2>/dev/null)" = true ]; then
+    flags+=(--chrome)
+  fi
+  flags+=("$@")
+  mkdir -p "$RC_CONF"
+  { echo "# claude-rc@$name: edit, then systemctl --user restart claude-rc@$name"
+    printf 'cd %q\n' "$dir"
+    printf 'exec claude remote-control'; [ ${#flags[@]} = 0 ] || printf ' %q' "${flags[@]}"; echo
+  } > "$RC_CONF/$name.sh"
+}
+install_unit() {
+  if ! cmp -s "$HERE/claude-rc@.service" "$UNIT_DIR/claude-rc@.service"; then
+    install -D -m 0644 "$HERE/claude-rc@.service" "$UNIT_DIR/claude-rc@.service"
+    systemctl --user daemon-reload
+  fi
+}
+
+# ------------------------------------------------------------------ chatgpt
+chatgpt_installed() { dpkg-query -W -f='${Version}' chatgpt 2>/dev/null || true; }
+chatgpt_newest() { # read straight from the repository apt uses, so no apt-get update or root needed
+  local src=/etc/apt/sources.list.d/chatgpt.sources uri suite comp
+  if [ ! -r "$src" ]; then apt-cache policy chatgpt 2>/dev/null | awk '/Candidate:/ {print $2}' || true; return 0; fi
+  uri=$(sed -n 's/^URIs: *//p' "$src" | awk '{print $1; exit}')
+  suite=$(sed -n 's/^Suites: *//p' "$src" | awk '{print $1; exit}')
+  comp=$(sed -n 's/^Components: *//p' "$src" | awk '{print $1; exit}')
+  curl -fsS --max-time 8 "$uri/dists/$suite/$comp/binary-$(dpkg --print-architecture)/Packages" 2>/dev/null |
+    awk '$1 == "Package:" {p = ($2 == "chatgpt")} p && $1 == "Version:" {print $2}' | sort -V | tail -1 || true
+}
+chatgpt_auth() { # yes, no or offline: does OpenAI accept the saved key; if not, a ping through Codex
+  local key account code
+  key=$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)
+  account=$(jq -r '.tokens.account_id // empty' "$HOME/.codex/auth.json" 2>/dev/null || true)
+  if [ -z "$key" ]; then echo no; return 0; fi
+  code=$(http_status https://chatgpt.com/backend-api/wham/usage "Authorization: Bearer $key" "ChatGPT-Account-Id: $account" 'User-Agent: codex_cli_rs')
+  case $code in 200) echo yes; return 0 ;; 000) echo offline; return 0 ;; esac
+  if chatgpt_ping; then echo yes; else echo no; fi
+}
+chatgpt_ping() { # a signed-in request through Codex that runs no model; Codex renews a stale key on the way
+  (cd /tmp && timeout 30 "$CODEX" cloud list --limit 1 </dev/null) >/dev/null 2>&1
+}
+chatgpt_pid() { # the app's main process; its helpers carry --type=
+  local pid
+  for pid in $(pgrep -u "$(id -u)" -x ChatGPT || true); do
+    if ! grep -qz -- '--type=' "/proc/$pid/cmdline" 2>/dev/null; then echo "$pid"; return 0; fi
+  done
+}
+chatgpt_stale() { [[ $(readlink "/proc/$1/exe" || true) == *' (deleted)' ]]; } # the package replaced the running binary
+chatgpt_busy() { # Codex threads mid-turn: their last turn event is task_started
+  local f n=0 last
+  while IFS= read -r f; do
+    last=$(grep -oE '"type":"event_msg","payload":\{"type":"(task_started|task_complete|turn_aborted)"' "$f" | tail -1 || true)
+    if [[ $last == *task_started* ]]; then n=$((n + 1)); fi
+  done < <(find "$CODEX_THREADS" -name 'rollout-*.jsonl' -mmin -1440 2>/dev/null || true)
+  echo $n
+}
+chatgpt_db() { local dbs=("$HOME"/.codex/sqlite/codex*.db); if [ ${#dbs[@]} = 1 ] && [ -f "${dbs[0]}" ]; then echo "${dbs[0]}"; fi; }
+chatgpt_remote() { # on or off: the app's remote access setting
+  local db; db=$(chatgpt_db)
+  if [ -z "$db" ]; then echo "?"; return 0; fi
+  python3 - "$db" 2>/dev/null <<'PY' || echo "?"
+import pathlib, sqlite3, sys
+with sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True) as db:
+    row = db.execute("SELECT enabled FROM local_app_server_feature_enablement WHERE feature_name = 'remote_control'").fetchone()
+print('on' if row and row[0] else 'off')
+PY
+}
+chatgpt_set_remote() { # the app must be closed while this changes
+  local db; db=$(chatgpt_db)
+  [ -n "$db" ] || die "expected one ChatGPT settings database in ~/.codex/sqlite; start the app once, then rerun"
+  python3 - "$db" <<'PY'
+import pathlib, sqlite3, sys, time
+with sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + '?mode=rw', uri=True) as db:
+    db.execute('''INSERT INTO local_app_server_feature_enablement (feature_name, enabled, updated_at)
+                  VALUES ('remote_control', 1, ?)
+                  ON CONFLICT(feature_name) DO UPDATE SET enabled = 1, updated_at = excluded.updated_at''',
+               (int(time.time() * 1000),))
+PY
+}
+chatgpt_pair() { # a short-lived app server with remote control prints the code
+  bash -s -- "$CODEX" <<'SH'
+set -e
+"$1" app-server --remote-control --listen unix:// </dev/null >/dev/null &
+server=$!
+trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+for i in {1..30}; do # enrollment may take a moment after the server starts
+  sleep 1
+  kill -0 "$server" || exit 1
+  if "$1" remote-control pair; then exit 0; fi
+done
+exit 1
+SH
+}
+gui_session() { systemctl --user show-environment | grep -E '^(WAYLAND_)?DISPLAY=' >/dev/null; }
+chatgpt_start() { # as a unit of its own, so it outlives whatever started it
+  if ! gui_session; then echo "no desktop session to open the ChatGPT app in; it opens at the next desktop login"; return 0; fi
+  systemd-run --user --collect --quiet --unit="app-chatgpt-$(date +%s)" -- /usr/bin/chatgpt
+}
+chatgpt_stop() { # signal the main process only, so the app closes cleanly
+  local pid; pid=$(chatgpt_pid)
+  [ -n "$pid" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  timeout 30 tail --pid="$pid" -f /dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+chatgpt_login() {
+  "$CODEX" login --device-auth # a link and a code to enter on any device; the app reads the same login
+  [ "$(chatgpt_auth)" = yes ] || die "ChatGPT still isn't signed in; rerun aibox auth chatgpt"
+}
+
+# ----------------------------------------------------------------- restarts
+restart_claude() { # restart_claude stale|all now|idle
+  local inst pid name v busy
+  inst=$(claude_installed)
+  for pid in $(rc_pids); do
+    v=$(rc_version "$pid"); name=$(rc_name "$pid")
+    if [ "$1" = stale ] && [ "$v" = "$inst" ]; then continue; fi
+    if [ -z "$name" ]; then
+      echo "claude: the server in $(short "$(rc_dir "$pid")") was started by hand, so aibox can't restart it; aibox setup moves it under aibox"
+      continue
+    fi
+    if [ "$2" = now ]; then
+      systemctl --user restart --no-block "claude-rc@$name.service"
+      echo "claude $name: restarting now"
+      continue
+    fi
+    busy=$(rc_busy "$pid")
+    schedule "rc-$name" claude "$name"
+    if [ "$busy" = 0 ]; then echo "claude $name: restarting now ($v → $inst)"
+    else echo "claude $name: restarts once its $busy busy session(s) finish ($v → $inst)"; fi
+  done
+  if [ "$1" = all ]; then # servers that keep failing, for instance after a sign-out
+    for name in $(rc_names); do
+      if ! systemctl --user is-active -q "claude-rc@$name.service"; then
+        systemctl --user restart --no-block "claude-rc@$name.service"
+        echo "claude $name: starting"
+      fi
+    done
+  fi
+}
+restart_chatgpt() { # restart_chatgpt stale|all now|idle
+  local pid busy; pid=$(chatgpt_pid)
+  if [ -z "$pid" ]; then
+    if [ "$1" = all ] && [ -n "$(chatgpt_installed)" ]; then chatgpt_start; echo "chatgpt: starting"; fi
+    return 0
+  fi
+  if [ "$1" = stale ] && ! chatgpt_stale "$pid"; then return 0; fi
+  if [ "$2" = now ]; then
+    systemd-run --user --collect --quiet --unit="aibox-chatgpt-$(date +%s)" -- "$SELF" _chatgpt-restart
+    echo "chatgpt: restarting now"
+    return 0
+  fi
+  busy=$(chatgpt_busy)
+  schedule chatgpt chatgpt
+  if [ "$busy" = 0 ]; then echo "chatgpt: restarting now"; else echo "chatgpt: restarts once its $busy busy thread(s) finish"; fi
+}
+when_idle() { # when_idle claude NAME | chatgpt: runs in its own unit, see schedule
+  case $1 in
+    claude) wait_idle unit_busy "$2" && systemctl --user restart "claude-rc@$2.service" ;;
+    chatgpt) wait_idle chatgpt_busy && chatgpt_stop && chatgpt_start ;;
+  esac
+}
+adopt() { # adopt PID NAME: once its sessions are idle, Ctrl+C the hand-started server, then start claude-rc@NAME
+  local pid=$1
+  wait_idle rc_busy "$pid"
+  if [ -d "/proc/$pid" ]; then
+    if [ "$(ps -o pgid= -p "$pid" | tr -d ' ' || true)" = "$pid" ]; then kill -INT -- "-$pid"; else kill -INT "$pid"; fi
+    timeout 60 tail --pid="$pid" -f /dev/null || die "pid $pid did not stop"
+  fi
+  systemctl --user enable --now "claude-rc@$2.service"
+}
+
+# ----------------------------------------------------------------- commands
+row() { printf '%-16s %-26s %-9s %-13s %-5s %s\n' "$@"; }
+status() {
+  local inst pid name v ses busy state note dir servers=0 total=0 totalbusy=0 rows=()
+  local have gpid running
+  inst=$(claude_installed)
+  for pid in $(rc_pids); do
+    name=$(rc_name "$pid"); v=$(rc_version "$pid")
+    ses=$(count $(session_pids "$pid")); busy=$(rc_busy "$pid")
+    if [ -z "$name" ]; then note="started by hand: aibox setup moves it"
+    elif waiting "rc-$name"; then note="restarts once idle"
+    elif [ "$v" != "$inst" ]; then note="old version: aibox restart claude"
+    else note=""; fi
+    rows+=("$(row "${name:-pid $pid}" "$(short "$(rc_dir "$pid")")" "$v" "$ses ($busy busy)" "$(up_for "$pid")" "$note")")
+    servers=$((servers + 1)); total=$((total + ses)); totalbusy=$((totalbusy + busy))
+  done
+  for name in $(rc_names); do # servers that should run but don't
+    state=$(systemctl --user is-active "claude-rc@$name.service" || true)
+    [ "$state" != active ] || continue
+    dir=$(conf_dir "$name")
+    if ! trusted "$dir"; then note="Claude doesn't trust the folder: aibox rc claude $(short "$dir")"
+    elif [ "$state" = inactive ]; then note="stopped: aibox rc claude $(short "$dir")"
+    else note="keeps failing; to see why: cd $(short "$dir") && claude remote-control"; fi
+    rows+=("$(row "$name" "$(short "$dir")" - - - "$note")")
+    servers=$((servers + 1))
+  done
+
+  printf '%-12s %-8s %-14s %-14s %s\n' AGENT AUTH VERSION UPDATE RUNNING
+  if [ $servers = 0 ]; then running="no servers: aibox rc claude"; else running="$total sessions, $totalbusy busy"; fi
+  printf '%-12s %-8s %-14s %-14s %s\n' "claude ($servers)" "$(claude_auth)" "$inst" \
+    "$(v=$(claude_newest); if newer "$v" "$inst"; then echo "$v"; else echo -; fi)" "$running"
+  have=$(chatgpt_installed)
+  if [ -z "$have" ]; then
+    printf '%-12s %-8s %-14s %-14s %s\n' chatgpt - - - "not installed"
+  else
+    gpid=$(chatgpt_pid)
+    if [ -z "$gpid" ]; then running="not running"
+    else
+      running="up $(up_for "$gpid"), remote $(chatgpt_remote), $(chatgpt_busy) busy"
+      if waiting chatgpt; then running+=", restarts once idle"
+      elif chatgpt_stale "$gpid"; then running+=", old version: aibox restart chatgpt"; fi
+    fi
+    printf '%-12s %-8s %-14s %-14s %s\n' chatgpt "$(chatgpt_auth)" "$have" \
+      "$(v=$(chatgpt_newest); if newer "$v" "$have"; then echo "$v"; else echo -; fi)" "$running"
+  fi
+  if [ ${#rows[@]} -gt 0 ]; then
+    echo
+    row SERVER DIR VERSION SESSIONS UP ""
+    printf '%s\n' "${rows[@]}"
+  fi
+}
+
+update() {
+  local agent
+  for agent in "${AGENTS[@]}"; do "update_$agent"; done
+  say "Restarts"
+  for agent in "${AGENTS[@]}"; do "restart_$agent" stale idle; done
+}
+update_claude() {
+  say "Claude Code"
+  claude update || echo "claude update failed; claude doctor shows why" >&2
+}
+update_chatgpt() {
+  local have new
+  say "ChatGPT"
+  have=$(chatgpt_installed); new=$(chatgpt_newest)
+  if [ -z "$have" ]; then echo "not installed"; return 0; fi
+  if [ -z "$new" ]; then echo "can't reach OpenAI's package repository; staying at $have"; return 0; fi
+  if ! newer "$new" "$have"; then echo "up to date ($have)"; return 0; fi
+  echo "$have → $new"
+  if apt_root "${APT_UPDATE[@]}" && apt_root "${APT_UPGRADE[@]}" >/dev/null; then echo "updated to $(chatgpt_installed)"
+  else echo "staying at $(chatgpt_installed)" >&2; fi
+}
+apt_root() { # as root: without a password once aibox setup allowed it, else asking for it
+  if sudo -n -l "$@" >/dev/null 2>&1; then sudo -n "$@"
+  elif [ -t 0 ]; then sudo "$@"
+  else echo "apt needs your password and there's no terminal to type it in: run aibox update over SSH, or aibox setup once" >&2; return 1
+  fi
+}
+
+auth() { local agent; for agent in "${AGENTS[@]}"; do "auth_$agent"; done; }
+auth_claude() {
+  say "Claude"
+  case $(claude_auth) in
+    yes) echo "signed in"; return 0 ;;
+    offline) echo "can't reach Anthropic; check the network, then rerun"; return 0 ;;
+  esac
+  [ -t 0 ] || die "signing in needs a terminal: ssh in and run aibox auth claude"
+  # Without a display, Claude prints the sign-in link instead of opening a browser on this screen.
+  env -u DISPLAY -u WAYLAND_DISPLAY claude auth login
+  [ "$(claude_auth)" = yes ] || die "Claude still isn't signed in; rerun aibox auth claude"
+  restart_claude all now # running servers hold the old login
+}
+auth_chatgpt() {
+  say "ChatGPT"
+  [ -x "$CODEX" ] || { echo "not installed"; return 0; }
+  case $(chatgpt_auth) in
+    yes) echo "signed in"; return 0 ;;
+    offline) echo "can't reach OpenAI; check the network, then rerun"; return 0 ;;
+  esac
+  [ -t 0 ] || die "signing in needs a terminal: ssh in and run aibox auth chatgpt"
+  chatgpt_login
+  restart_chatgpt all now
+}
+
+rc() {
+  local agent confirm=''
+  if [ "${ARGS[0]:-}" = rm ]; then rc_rm "${ARGS[1]:-}"; return 0; fi
+  if [ -z "$AGENT" ]; then confirm=confirm; fi # bare `aibox rc` asks before serving a new directory
+  for agent in "${AGENTS[@]}"; do "rc_$agent" "${ARGS[0]:-.}" "$confirm"; done
+}
+rc_claude() { # rc_claude DIR [confirm]
+  local dir name pid argv busy confirm=${2:-}
+  say "Claude Remote Control"
+  dir=$(cd "$1" 2>/dev/null && pwd) || die "no directory $1"
+  install_unit
+  for name in $(rc_names); do
+    if [ "$(conf_dir "$name")" = "$dir" ]; then
+      if [ "$(systemctl --user show -p SubState --value "claude-rc@$name.service")" = running ]; then
+        echo "$name serves $(short "$dir")"
+      else trust "$dir"; start_server "$name" "$dir"; fi
+      return 0
+    fi
+  done
+  name=$(name_for "$dir")
+  for pid in $(rc_pids); do # two servers in one directory break bringing sessions back, so take this one over
+    [ "$(rc_dir "$pid")" = "$dir" ] || continue
+    busy=$(rc_busy "$pid")
+    echo "a server started by hand serves $(short "$dir"): pid $pid, $(count $(session_pids "$pid")) session(s), $busy busy"
+    ask "Move it under aibox as $name? Its sessions come along; the move waits until they're idle." || return 0
+    { mapfile -d '' -t argv < "/proc/$pid/cmdline"; } 2>/dev/null || die "pid $pid is gone; rerun"
+    rc_write "$name" "$dir" "${argv[@]:2}"
+    systemd-run --user --collect --quiet --unit="aibox-adopt-$name" -- "$SELF" _adopt "$pid" "$name"
+    if [ "$busy" = 0 ]; then echo "moving now"; else echo "moves once its $busy busy session(s) finish"; fi
+    return 0
+  done
+  if [ "$confirm" = confirm ] && ! ask "Serve $(short "$dir") with Claude Remote Control?"; then echo "skipped"; return 0; fi
+  trust "$dir"
+  rc_write "$name" "$dir"
+  start_server "$name" "$dir"
+}
+rc_rm() {
+  local key=$1 name='' dir n
+  [ -n "$key" ] || die "usage: aibox rc rm NAME|DIR"
+  if [ -e "$RC_CONF/$key.sh" ]; then name=$key
+  else
+    dir=$(cd "$key" 2>/dev/null && pwd) || die "no server or directory $key"
+    for n in $(rc_names); do if [ "$(conf_dir "$n")" = "$dir" ]; then name=$n; fi; done
+  fi
+  [ -n "$name" ] || die "aibox runs no server for $key"
+  systemctl --user disable --now --quiet "claude-rc@$name.service"
+  rm -f "$RC_CONF/$name.sh"
+  echo "$name stopped and removed"
+}
+rc_chatgpt() {
+  local pid
+  say "ChatGPT remote access"
+  [ -x "$CODEX" ] || die "the ChatGPT app isn't installed"
+  case $(chatgpt_auth) in
+    yes) ;;
+    offline) die "can't reach OpenAI; check the network, then rerun" ;;
+    *) [ -t 0 ] || die "ChatGPT isn't signed in: ssh in and run aibox auth chatgpt"; chatgpt_login ;;
+  esac
+  install -D -m 0644 "$HERE/chatgpt.desktop" "$HOME/.config/autostart/chatgpt.desktop" # opens with every desktop login
+  pid=$(chatgpt_pid)
+  if [ "$(chatgpt_remote)" != on ] || [ $PAIR = 1 ]; then
+    if [ -n "$pid" ]; then
+      ask "This closes the ChatGPT app for a moment, with $(chatgpt_busy) busy thread(s). Go on?" || return 0
+      chatgpt_stop
+    fi
+    if ! chatgpt_set_remote; then chatgpt_start; die "couldn't turn remote access on"; fi
+    if [ $PAIR = 1 ]; then
+      echo "Enter this pairing code in ChatGPT on the controlling device:"
+      chatgpt_pair || echo "no pairing code; rerun aibox rc chatgpt --pair" >&2
+    fi
+    chatgpt_start
+  elif [ -z "$pid" ]; then chatgpt_start
+  fi
+  echo "remote access on; the app opens with every desktop login"
+}
+
+restart() {
+  local agent when=idle
+  if [ $NOW = 1 ]; then when=now; fi
+  say "Restarts"
+  for agent in "${AGENTS[@]}"; do "restart_$agent" all "$when"; done
+}
+
+setup() {
+  local pid tmp found=0
+  [ -t 0 ] || die "setup asks for your password: ssh in and run aibox setup"
+  install_unit
+
+  say "Start at boot"
+  if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" != yes ]; then
+    loginctl enable-linger "$USER" 2>/dev/null || sudo loginctl enable-linger "$USER"
+  fi
+  echo "on: servers start at boot and keep running after you log out of the desktop"
+
+  say "ChatGPT updates without a password"
+  if [ ! -e "$SUDOERS" ]; then
+    echo "Allowing exactly these two commands as root, without a password:"
+    printf '  %s\n' "${APT_UPDATE[*]}" "${APT_UPGRADE[*]}"
+    tmp=$(mktemp)
+    printf '# aibox update: refresh package lists, upgrade the ChatGPT and Claude desktop apps\n%s ALL=(root) NOPASSWD: %s, %s\n' \
+      "$USER" "${APT_UPDATE[*]}" "${APT_UPGRADE[*]}" > "$tmp"
+    # sudo ignores sudoers.d files with a dot in their name, so the candidate stays inert until checked.
+    sudo install -m 0440 -o root -g root "$tmp" "$SUDOERS.new"
+    rm -f "$tmp"
+    if sudo visudo -cf "$SUDOERS.new" >/dev/null; then sudo mv "$SUDOERS.new" "$SUDOERS"
+    else sudo rm -f "$SUDOERS.new"; die "the sudoers rule didn't pass visudo; nothing changed"; fi
+  fi
+  echo "on ($SUDOERS)"
+
+  for pid in $(rc_pids); do
+    [ -z "$(rc_name "$pid")" ] || continue
+    found=1
+    rc_claude "$(rc_dir "$pid")"
+  done
+  if [ $found = 0 ]; then say "Servers started by hand"; echo "none"; fi
+}
+
+# --------------------------------------------------------------------- main
+case ${1:-} in # internal: what schedule, adopt and restarts run in units of their own
+  _when-idle) shift; when_idle "$@"; exit ;;
+  _adopt) adopt "$2" "$3"; exit ;;
+  _chatgpt-restart) chatgpt_stop; chatgpt_start; exit ;;
+esac
+if [ $# -ge 2 ] && { [ "$1" = claude ] || [ "$1" = chatgpt ]; }; then set -- "$2" "$1" "${@:3}"; fi
+CMD=${1:-status}
+[ $# = 0 ] || shift
+NOW=0 PAIR=0 AGENT='' ARGS=()
+for a in "$@"; do
+  case $a in
+    --now) NOW=1 ;;
+    --pair) PAIR=1 ;;
+    claude|chatgpt) if [ -z "$AGENT" ] && [ ${#ARGS[@]} = 0 ]; then AGENT=$a; else ARGS+=("$a"); fi ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+if [ -n "$AGENT" ]; then AGENTS=("$AGENT"); else AGENTS=(claude chatgpt); fi
+case $CMD in
+  status|ls) status ;;
+  update) update ;;
+  auth) auth ;;
+  rc) rc ;;
+  restart) restart ;;
+  setup) setup ;;
+  help|-h|--help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0" ;;
+  *) die "unknown command $CMD; see aibox help" ;;
+esac

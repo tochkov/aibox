@@ -1,0 +1,25 @@
+# Claude Remote Control server NAME, managed by aibox. claude.ai/code and the
+# Claude app drive sessions in the directory that ~/.config/aibox/rc/NAME.sh
+# enters; that script also holds the remote-control flags. Edit it, then
+# `systemctl --user restart claude-rc@NAME`.
+#
+# A login shell runs the script, so sessions get the PATH a terminal gets.
+# Stopping sends SIGINT to the server and its sessions, exactly like Ctrl+C in a
+# terminal: the server keeps its sessions, and the next start in the same
+# directory, within about 4 hours, brings them all back. Restart=always also
+# covers the server giving up after about 10 minutes without network.
+# The status display redraws every second, so stdout is discarded; errors still
+# reach the journal (aibox rc logs NAME).
+[Unit]
+Description=Claude Remote Control %i
+
+[Service]
+ExecStart=/bin/bash -l %h/.config/aibox/rc/%i.sh
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=always
+RestartSec=15
+StandardOutput=null
+
+[Install]
+WantedBy=default.target
