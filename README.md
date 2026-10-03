@@ -39,3 +39,13 @@ AGENT is `claude` or `chatgpt`; without it, both.
 - Sign-in checks ask Anthropic and OpenAI directly. If the saved key is refused, aibox
   makes a small request through the agent itself, which renews a stale key.
 - Some checks read Claude's and Codex's internal files, so an update to either can break one.
+
+## TODO
+
+- `aibox install [AGENT]`: install Claude Code and the ChatGPT app, so `setup` covers a
+  fresh machine.
+
+## See also
+
+[yolovm](https://github.com/tochkov/yolovm): Ubuntu desktop VMs for coding agents. aibox
+looks after the machine itself.
